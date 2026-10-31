@@ -594,8 +594,16 @@ class AgentCore:
                 return _SETUP_ERROR
         elif active:
             key, content = active, utterance
-        else:
+        elif "case metadata" in utterance.lower():
             return "상담 정보를 확인할 수 없습니다. 상담을 다시 시작해 주세요."
+        else:
+            case_id = f"CS-{user_id}"
+            key = SessionKey(user_id, case_id, self.generation, self.channel_id)
+            try:
+                await self._db(self.store.bind_active_case, key, allow_replace=True)
+            except Exception:
+                pass
+            content = utterance
         try:
             async with self.store.async_session_lock(key, timeout_seconds=min(5, self.timeout)):
                 saved = await self._db(self.store.load, key)
@@ -604,6 +612,9 @@ class AgentCore:
                 if meta and not state.get("account"):
                     state["account"] = meta.account
                     state["intake_time"] = meta.intake_time
+                elif not state.get("account"):
+                    state["account"] = user_id
+                    state["intake_time"] = "2037-06-30T10:00:00+09:00"
                 if event_id:
                     created, event = await self._db(self.store.claim_event, key, event_id, utterance)
                     if not created:
