@@ -17,6 +17,9 @@ import html
 import base64
 import hmac
 import asyncio
+import hashlib
+import logging
+import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -111,20 +114,23 @@ DEFAULT_CONFIG = {
 
 def load_config() -> dict:
     # 1. 로컬 .env 우선 로드 (gitignore 대상이므로 깃 노출 없음)
-    env_local = os.path.join(os.path.dirname(__file__), ".env")
-    if os.path.exists(env_local):
-        try:
-            with open(env_local, "r", encoding="utf-8") as f:
-                for line in f:
-                    line_str = line.strip()
-                    if line_str and not line_str.startswith("#") and "=" in line_str:
-                        k, v = line_str.split("=", 1)
-                        k = k.strip()
-                        v = v.strip().strip('"').strip("'")
-                        if k and k not in os.environ:
-                            os.environ[k] = v
-        except Exception:
-            pass
+    for env_candidate in (
+        os.path.join(os.path.dirname(__file__), ".env"),
+        os.path.join(os.path.dirname(__file__), "..", ".env"),
+    ):
+        if os.path.exists(env_candidate):
+            try:
+                with open(env_candidate, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line_str = line.strip()
+                        if line_str and not line_str.startswith("#") and "=" in line_str:
+                            k, v = line_str.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
 
     config = DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
@@ -472,17 +478,13 @@ async def call_llm(utterance: str) -> str:
         return "질문을 확인했습니다. 다시 한번 질문해 주시겠어요?"
 
     msg = response.choices[0].message
-    reply = (
-        msg.content
-        or getattr(msg, "reasoning_content", None)
-        or getattr(msg, "reasoning", None)
-        or ""
-    ).strip()
+    # Never expose internal model reasoning to customers or admin test replies.
+    reply = (msg.content or "").strip()
 
     if "<think>" in reply and "</think>" in reply:
         reply = reply.split("</think>")[-1].strip()
     elif "<think>" in reply:
-        reply = reply.split("<think>")[-1].strip()
+        reply = reply.split("<think>", 1)[0].strip()
 
     if not reply:
         reply = "안녕하세요! 질문해 주시면 성심껏 답변해 드리겠습니다."
@@ -513,14 +515,91 @@ async def send_kakao_callback(callback_token: str, reply_text: str, bot_token: s
             }
         }
     }
+    if not callback_token or not bot_token:
+        return 0
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.post(url, json=body, headers=headers)
-            print(f"[Kakao Callback Success] 상태: {resp.status_code}, 내용: {resp.text[:120]}")
+            if resp.status_code == 429:
+                try:
+                    delay = float(resp.headers.get("retry-after", "0"))
+                except (TypeError, ValueError):
+                    delay = 0.0
+                if 0.0 <= delay <= 2.0:
+                    await asyncio.sleep(delay)
+                    resp = await client.post(url, json=body, headers=headers)
+            if 200 <= resp.status_code < 300:
+                logging.info("Kakao callback delivered (HTTP %s)", resp.status_code)
+            else:
+                logging.warning("Kakao callback rejected (HTTP %s)", resp.status_code)
             return resp.status_code
-    except Exception as e:
-        print(f"[Kakao Callback Error] 전송 실패: {e}")
-        return 500
+    except httpx.HTTPError:
+        logging.warning("Kakao callback delivery outcome unknown")
+        return 0
+
+
+def fit_simple_text(value: str, limit: int = 485) -> str:
+    """Enforce the contest's 500-character maximum on the actual output."""
+    text = value.strip() if isinstance(value, str) else ""
+    if not text:
+        return "문의 내용을 확인하지 못했습니다. 다시 말씀해 주시겠어요?"
+    if len(text) <= limit:
+        return text
+    sentences = re.split(r"(?<=[.!?。])\s+|\n+", text)
+    tail = sentences[-1].strip() if len(sentences) > 1 else ""
+    if tail and len(tail) < limit // 2:
+        return text[: limit - len(tail) - 2].rstrip() + "\n" + tail
+    return text[:limit].rstrip()
+
+
+def simple_text_response(reply: str) -> dict:
+    return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": fit_simple_text(reply)}}]}}
+
+
+async def dispatch_agent_turn(utterance: str, user_id: str, event_id: Optional[str] = None) -> str:
+    if utterance.strip() in ("스킬 테스트", "스킬테스트"):
+        return "AI_TOP_100 카카오봇 에이전트 스킬 연결이 정상적으로 완료되었습니다! 질문을 입력하시면 AI가 즉시 답변합니다."
+    use_contest_core = bool(
+        os.getenv("ACTION_API_TOKEN")
+        or os.getenv("DATABASE_URL")
+        or os.getenv("LOCAL_SESSION_DB")
+        or os.getenv("CONTEST_TRUST_FIRST_METADATA") == "1"
+        or utterance.lstrip().lower().startswith("case metadata")
+    )
+    if not use_contest_core:
+        return await call_llm(utterance)
+    from agent_core import generate_reply
+    cfg = dict(current_config)
+    if event_id:
+        cfg["_event_id"] = event_id
+    return await generate_reply(utterance, user_id, cfg)
+
+
+_callback_tasks: set = set()
+_callback_events: Dict[str, float] = {}
+
+
+def _callback_event_key(user_id: str, callback_token: str) -> str:
+    return hashlib.sha256((user_id + "\0" + callback_token).encode("utf-8")).hexdigest()
+
+
+async def _run_callback(utterance: str, user_id: str, callback_token: str, bot_token: str) -> None:
+    started = time.monotonic()
+    try:
+        reply = await asyncio.wait_for(dispatch_agent_turn(utterance, user_id), timeout=40.0)
+    except Exception:
+        logging.exception("Agent turn failed")
+        reply = "문의 처리 중 오류가 발생했습니다. 잠시 후 다시 말씀해 주세요."
+    reply = fit_simple_text(reply)
+    status = await send_kakao_callback(callback_token, reply, bot_token)
+    delivered = 200 <= status < 300
+    add_log(
+        user_id=user_id,
+        utterance="",
+        response="",
+        latency_sec=time.monotonic() - started,
+        status="success" if delivered else "callback_failed",
+    )
 
 # -------------------------------------------------------------
 # 6. 엔드포인트: 루트(/) & 헬스체크(/health)
@@ -538,6 +617,8 @@ async def health_check():
         "model": current_config.get("model"),
         "key_configured": bool(current_config.get("openai_api_key")),
         "bot_token_configured": bool(current_config.get("kakao_bot_token")),
+        "action_token_configured": bool(os.getenv("ACTION_API_TOKEN")),
+        "database_url_configured": bool(os.getenv("DATABASE_URL")),
         "admin_url": "/admin",
         "webhook_url": "/webhook",
         "webhook_alias": "/webhool"
@@ -562,119 +643,72 @@ async def kakao_webhook(request: Request):
             "endpoints": ["/webhook", "/webhool"]
         }
 
-    start_time = time.time()
+    started = time.monotonic()
     try:
-        try:
-            body = await request.json()
-        except Exception:
-            try:
-                form = await request.form()
-                body = dict(form)
-            except Exception:
-                body = {}
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid event"}, status_code=400)
 
-        # 1. 콜백 토큰 추출 (카카오 디벨로퍼스 봇 규격)
-        d_obj = body.get("d", {}) if isinstance(body.get("d"), dict) else {}
-        callback_token = (
-            d_obj.get("callbackToken")
-            or body.get("callbackToken")
-            or request.headers.get("x-bot-callback-token")
-            or request.headers.get("x-kakao-callback-token")
-            or ""
-        )
+    d_obj = body.get("d") if isinstance(body.get("d"), dict) else {}
+    event_type = body.get("t")
+    if isinstance(event_type, str) and event_type in {"ENTRANCE", "CHAT_JOIN", "LEAVE", "AD_REWARD"}:
+        return JSONResponse({"status": "ignored"}, status_code=200)
 
-        # 2. 발화(utterance) 추출
-        user_request = body.get("userRequest", {})
-        action = body.get("action", {})
-        params = action.get("params", {})
-        detail_params = action.get("detailParams", {})
+    user_request = body.get("userRequest") if isinstance(body.get("userRequest"), dict) else {}
+    user_info = user_request.get("user") or d_obj.get("author") or d_obj.get("user") or {}
+    if not isinstance(user_info, dict):
+        return JSONResponse({"error": "invalid user"}, status_code=400)
+    user_id = user_info.get("id")
+    if not isinstance(user_id, (str, int)) or isinstance(user_id, bool) or not str(user_id).strip():
+        return JSONResponse({"error": "missing user identity"}, status_code=400)
+    user_id = str(user_id).strip()
 
-        utterance = (
-            d_obj.get("content")
-            or d_obj.get("message")
-            or d_obj.get("text")
-            or d_obj.get("utterance")
-            or user_request.get("utterance")
-            or params.get("question")
-            or params.get("utterance")
-            or params.get("sys_text")
-            or detail_params.get("question", {}).get("origin")
-            or detail_params.get("utterance", {}).get("origin")
-            or body.get("utterance")
-            or body.get("message")
-            or body.get("text")
-            or body.get("query")
-            or request.query_params.get("utterance")
-            or request.query_params.get("message")
-            or request.query_params.get("q")
-            or ""
-        )
-        if isinstance(utterance, str):
-            utterance = utterance.strip()
-        else:
-            utterance = str(utterance).strip()
+    action = body.get("action") if isinstance(body.get("action"), dict) else {}
+    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    utterance = (
+        d_obj.get("content")
+        or d_obj.get("message")
+        or d_obj.get("text")
+        or d_obj.get("utterance")
+        or user_request.get("utterance")
+        or params.get("question")
+        or params.get("utterance")
+    )
+    if not isinstance(utterance, str) or not utterance.strip():
+        return JSONResponse({"error": "missing text or unsupported event"}, status_code=400)
+    utterance = utterance.strip()
 
-        user_info = user_request.get("user", {}) or d_obj.get("author", {}) or d_obj.get("user", {})
-        user_id = user_info.get("id", "kakao_user")
+    callback_token = d_obj.get("callbackToken") or body.get("callbackToken") or request.headers.get("x-bot-callback-token") or ""
+    if callback_token and not isinstance(callback_token, str):
+        return JSONResponse({"error": "invalid callback token"}, status_code=400)
 
-        # 3-A. 카카오 디벨로퍼스 봇: 콜백 토큰이 있는 경우 (1초 내 200 즉각 반환 + 백그라운드 콜백)
-        if callback_token:
-            bot_token = current_config.get("kakao_bot_token") or get_default_kakao_token()
-            
-            async def run_callback_task(q: str, token: str, uid: str):
-                t0 = time.time()
-                try:
-                    if q in ["스킬 테스트", "test", "ping", "테스트"]:
-                        reply = "AI_TOP_100 카카오봇 연결이 정상적으로 완료되었습니다! 무엇이든 질문해 주세요."
-                    elif not q:
-                        reply = "안녕하세요! AI_TOP_100 에이전트입니다. 무엇이 궁금하신가요?"
-                    else:
-                        reply = await call_llm(q)
-                except Exception as ex:
-                    print(f"[Async LLM Error] {ex}")
-                    reply = "질문을 처리하는 중 오류가 발생했습니다. 잠시 후 다시 질문해 주세요."
+    if callback_token:
+        bot_token = current_config.get("kakao_bot_token") or get_default_kakao_token()
+        if not bot_token:
+            return JSONResponse({"error": "bot token unavailable"}, status_code=503)
+        now = time.monotonic()
+        for old_key, stamp in list(_callback_events.items()):
+            if now - stamp > 3600:
+                _callback_events.pop(old_key, None)
+        key = _callback_event_key(user_id, callback_token)
+        if key in _callback_events:
+            return JSONResponse({"status": "OK", "message": "Event already queued"}, status_code=200)
+        _callback_events[key] = now
+        task = asyncio.create_task(_run_callback(utterance, user_id, callback_token, bot_token))
+        _callback_tasks.add(task)
+        task.add_done_callback(_callback_tasks.discard)
+        return JSONResponse({"status": "OK", "message": "Event received, callback queued"}, status_code=200)
 
-                if len(reply) > 1000:
-                    reply = reply[:990] + "\n...(생략)"
-
-                lat = time.time() - t0
-                add_log(user_id=uid, utterance=q, response=reply, latency_sec=lat)
-                await send_kakao_callback(token, reply, bot_token)
-
-            asyncio.create_task(run_callback_task(utterance or "안녕하세요", callback_token, user_id))
-            return JSONResponse(content={"status": "OK", "message": "Event received, callback queued"}, status_code=200)
-
-        # 3-B. 카카오 i 오픈빌더 / 직접 호출: 동기적 SkillResponse 반환
-        if utterance in ["스킬 테스트", "test", "ping", "테스트"]:
-            bot_reply = "AI_TOP_100 카카오봇 에이전트 스킬 연결이 정상적으로 완료되었습니다! 질문을 입력하시면 AI가 즉시 답변합니다."
-        elif not utterance:
-            utterance = "안녕하세요"
-            bot_reply = await call_llm(utterance)
-        else:
-            bot_reply = await call_llm(utterance)
-
-    except Exception as exc:
-        print(f"[Webhook Error] 처리 중 예외 발생: {exc}")
-        bot_reply = "질문을 정상적으로 처리하지 못했습니다. 잠시 후 다시 질문해 주세요."
-
-    if len(bot_reply) > 1000:
-        bot_reply = bot_reply[:990] + "\n...(생략)"
-
-    latency = time.time() - start_time
-    add_log(user_id=user_id, utterance=utterance, response=bot_reply, latency_sec=latency)
-
-    return {
-        "version": "2.0",
-        "template": {
-            "outputs": [
-                {
-                    "simpleText": {
-                        "text": bot_reply
-                    }
-                }
-            ]
-        }
-    }
+    try:
+        reply = await asyncio.wait_for(dispatch_agent_turn(utterance, user_id), timeout=40.0)
+        status = "success"
+    except Exception:
+        logging.exception("Agent turn failed")
+        reply, status = "문의 처리 중 오류가 발생했습니다. 잠시 후 다시 말씀해 주세요.", "error"
+    add_log(user_id=user_id, utterance="", response="", latency_sec=time.monotonic() - started, status=status)
+    return simple_text_response(reply)
 
 # -------------------------------------------------------------
 # 8. 관리자 API (PIN 인증 필수 및 비밀값 마스킹 보호)
@@ -760,11 +794,60 @@ async def update_config(payload: ConfigUpdateRequest, request: Request):
     _cached_client = None
 
     save_config(current_config)
-    return {"status": "success", "message": "1초 만에 설정이 실시간 적용되었습니다."}
+    return {"status": "success", "message": "설정이 저장되었습니다. 상담 지식은 배포된 knowledge_base.md를 사용합니다."}
 
 class TestChatRequest(BaseModel):
     pin: Optional[str] = ""
     message: str
+    session_id: str = "default"
+
+
+async def _diagnose_database() -> str:
+    url = os.getenv("DATABASE_URL", "")
+    if not url:
+        return "missing"
+
+    def probe() -> bool:
+        import psycopg
+        with psycopg.connect(url, connect_timeout=5) as connection:
+            return connection.execute("SELECT 1").fetchone() == (1,)
+
+    try:
+        return "ok" if await asyncio.wait_for(asyncio.to_thread(probe), timeout=7) else "failed"
+    except Exception:
+        return "failed"
+
+
+async def _diagnose_action_api() -> str:
+    token = os.getenv("ACTION_API_TOKEN", "")
+    if not token:
+        return "missing"
+    try:
+        from codex_action_api_client import ActionAPIClient
+        result = await ActionAPIClient(token).execute("API_20", {"code": "SUBAK15"}, tc_id="L-60", timeout=6, max_retries=0)
+        return "ok" if result.get("ok") else "failed"
+    except Exception:
+        return "failed"
+
+
+@app.post("/api/diagnostics")
+async def diagnostics(request: Request):
+    """Admin-triggered pre-submission checks; no credentials in response."""
+    client_ip = request.client.host if request.client else "unknown"
+    if is_rate_limited(client_ip):
+        raise HTTPException(status_code=429, detail="잠시 후 다시 시도해 주세요.")
+    if not is_valid_pin(extract_pin(request)):
+        record_failed_pin(client_ip)
+        raise HTTPException(status_code=401, detail="PIN 번호가 일치하지 않습니다.")
+    database, action = await asyncio.gather(_diagnose_database(), _diagnose_action_api())
+    return {
+        "database": database,
+        "action_api": action,
+        "text_model_configured": bool(current_config.get("openai_api_key")),
+        "bot_token_configured": bool(current_config.get("kakao_bot_token")),
+        "media_key_configured": bool(os.getenv("GEMINI_API_KEY") or os.getenv("MEDIA_OPENAI_API_KEY")),
+        "note": "연결 상태만 확인했습니다. 카카오 수신과 모델 답변은 별도 시험이 필요합니다.",
+    }
 
 @app.post("/api/test-chat")
 async def test_chat(payload: TestChatRequest, request: Request):
@@ -778,13 +861,20 @@ async def test_chat(payload: TestChatRequest, request: Request):
         raise HTTPException(status_code=401, detail="PIN 번호가 일치하지 않습니다.")
 
     t0 = time.time()
-    reply = await call_llm(payload.message)
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", payload.session_id):
+        raise HTTPException(status_code=400, detail="잘못된 테스트 세션 ID입니다.")
+    try:
+        reply = await asyncio.wait_for(dispatch_agent_turn(payload.message, "admin-test:" + payload.session_id), timeout=40.0)
+    except Exception:
+        logging.exception("Admin test turn failed")
+        reply = "문의 처리 중 오류가 발생했습니다. 잠시 후 다시 말씀해 주세요."
+    reply = fit_simple_text(reply)
     latency = time.time() - t0
     return {
         "reply": reply,
         "latency": f"{latency:.2f}s",
         "char_count": len(reply),
-        "exceeds_kakao_limit": len(reply) > 1000
+        "exceeds_kakao_limit": len(reply) > 500
     }
 
 @app.get("/api/logs")
@@ -1055,6 +1145,11 @@ async def admin_page(request: Request, pin: str = ""):
       </div>
     </div>
 
+    <div class="alert alert-dark border-secondary mb-4 p-3">
+      <button class="btn btn-sm btn-outline-info" onclick="checkConnections()">DB·액션 API 연결 확인</button>
+      <span id="diagnosticResult" class="small ms-2">제출 전에만 사용하세요. 공개 TC 조회 1회가 발생합니다.</span>
+    </div>
+
     <div class="row g-4">
       <!-- 좌측: 설정 영역 -->
       <div class="col-lg-7">
@@ -1062,7 +1157,7 @@ async def admin_page(request: Request, pin: str = ""):
         <!-- 시스템 프롬프트 -->
         <div class="card mb-4">
           <div class="card-header d-flex justify-content-between align-items-center">
-            <span><i class="bi bi-cpu-fill text-primary me-2"></i>1. 시스템 프롬프트</span>
+            <span><i class="bi bi-cpu-fill text-primary me-2"></i>1. 기존 시스템 프롬프트</span>
             <div class="btn-group btn-group-sm">
               <button class="btn btn-outline-secondary" onclick="setPreset('solver')">대회 해결사</button>
               <button class="btn btn-outline-secondary" onclick="setPreset('cs')">친절 상담봇</button>
@@ -1071,6 +1166,7 @@ async def admin_page(request: Request, pin: str = ""):
           </div>
           <div class="card-body">
             <textarea id="systemPromptInput" class="form-control" rows="4">{sp}</textarea>
+            <div class="form-text text-secondary mt-1">현재 대회 상담 엔진은 이 입력란 대신 배포된 지식 베이스와 기본 응대 지침을 사용합니다.</div>
           </div>
         </div>
 
@@ -1078,11 +1174,11 @@ async def admin_page(request: Request, pin: str = ""):
         <div class="card mb-4">
           <div class="card-header d-flex justify-content-between align-items-center">
             <span><i class="bi bi-database-fill-gear text-warning me-2"></i>2. 실시간 참조 데이터 / 지식 문서</span>
-            <span class="badge bg-primary">1초 즉시 주입</span>
+            <span class="badge bg-secondary">상담 엔진 미반영</span>
           </div>
           <div class="card-body">
             <textarea id="referenceDataInput" class="form-control" rows="6">{ref}</textarea>
-            <div class="form-text text-secondary mt-1">대회 당일 주어지는 규정, 도메인 문서, 핵심 데이터를 여기에 붙여넣고 저장하면 1초 만에 카카오톡 봇에 반영됩니다.</div>
+            <div class="form-text text-secondary mt-1">대회 상담 지식은 배포된 knowledge_base.md에서 읽습니다. 이 입력란은 현재 상담 응답에 반영되지 않습니다.</div>
           </div>
         </div>
 
@@ -1143,11 +1239,14 @@ async def admin_page(request: Request, pin: str = ""):
             <button class="btn btn-sm btn-outline-secondary" onclick="clearTestChat()">지우기</button>
           </div>
           <div class="card-body">
+            <label for="testSessionId" class="form-label small">테스트 세션 ID (다른 TC는 다른 ID 사용)</label>
+            <input type="text" id="testSessionId" class="form-control mb-2" value="default" maxlength="64" pattern="[A-Za-z0-9._-]+">
+            <p class="text-secondary small">첫 메시지에 공개 TC의 case metadata와 고객 문의를 함께 붙여 넣으세요. Ctrl+Enter로 전송합니다.</p>
             <div id="chatHistory" class="p-2 border border-secondary rounded mb-3" style="min-height: 220px; max-height: 280px; overflow-y: auto; background-color: #0b1120;">
-              <div class="chat-bubble-bot">안녕하세요! 설정된 프롬프트와 데이터로 대화를 테스트해 보세요.</div>
+              <div class="chat-bubble-bot">안녕하세요! 대회 테스트 케이스로 상담을 확인해 보세요.</div>
             </div>
             <div class="input-group">
-              <input type="text" id="testMessageInput" class="form-control" placeholder="테스트 질문을 입력하세요..." onkeydown="if(event.key==='Enter') sendTestMessage()">
+              <textarea id="testMessageInput" class="form-control" rows="4" placeholder="case metadata와 테스트 질문을 입력하세요..." onkeydown="if(event.key==='Enter' &amp;&amp; event.ctrlKey) {{ event.preventDefault(); sendTestMessage(); }}"></textarea>
               <button class="btn btn-info text-white" onclick="sendTestMessage()"><i class="bi bi-send-fill"></i></button>
             </div>
             <div id="testMeta" class="text-secondary small mt-2">응답 속도: -</div>
@@ -1175,12 +1274,24 @@ async def admin_page(request: Request, pin: str = ""):
     const currentPin = {client_pin_js};
     localStorage.setItem("kakao_bot_pin", currentPin);
 
+    async function checkConnections() {{
+      const output = document.getElementById("diagnosticResult");
+      output.innerText = "연결 확인 중...";
+      try {{
+        const response = await fetch("/api/diagnostics", {{method: "POST", headers: {{"x-admin-pin": currentPin}}}});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || "확인 실패");
+        const status = (v) => v === "ok" ? "정상" : v === "missing" ? "미설정" : "확인 실패";
+        output.innerText = `DB: ${{status(data.database)}} · 액션 API: ${{status(data.action_api)}} · 미디어 키: ${{data.media_key_configured ? "설정됨" : "미설정"}}. 실제 카카오 대화는 별도 시험이 필요합니다.`;
+      }} catch (error) {{ output.innerText = "연결 확인 실패: " + error.message; }}
+    }}
+
     document.getElementById("webhookUrlDisplay").innerText = window.location.origin + "/webhook";
 
     function copyUrl(path) {{
       const url = window.location.origin + path;
       navigator.clipboard.writeText(url).then(() => {{
-        alert("카카오 디벨로퍼스 웹훅 URL이 복사되었습니다:\n" + url);
+        alert("카카오 디벨로퍼스 웹훅 URL이 복사되었습니다:\\n" + url);
       }}).catch(() => {{
         prompt("웹훅 URL을 복사하세요:", url);
       }});
@@ -1237,7 +1348,12 @@ async def admin_page(request: Request, pin: str = ""):
     async function sendTestMessage() {{
       const input = document.getElementById("testMessageInput");
       const msg = input.value.trim();
+      const sessionId = document.getElementById("testSessionId").value.trim();
       if (!msg) return;
+      if (!/^[A-Za-z0-9._-]{{1,64}}$/.test(sessionId)) {{
+        document.getElementById("testMeta").innerText = "세션 ID는 영문·숫자·점·밑줄·하이픈으로 입력해 주세요.";
+        return;
+      }}
 
       input.value = "";
       const history = document.getElementById("chatHistory");
@@ -1264,9 +1380,10 @@ async def admin_page(request: Request, pin: str = ""):
             "Content-Type": "application/json",
             "x-admin-pin": currentPin
           }},
-          body: JSON.stringify({{ pin: currentPin, message: msg }})
+          body: JSON.stringify({{ pin: currentPin, message: msg, session_id: sessionId }})
         }});
         const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "테스트 요청에 실패했습니다.");
         botBubble.className = "chat-bubble-bot";
         botBubble.innerText = data.reply;
         history.scrollTop = history.scrollHeight;
@@ -1325,9 +1442,9 @@ async def admin_page(request: Request, pin: str = ""):
 # -------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    print(f"\n=======================================================")
+    print(f"\\n=======================================================")
     print(f"🚀 AI_TOP_100 카카오봇 에이전트 서버 가동 (v1.5.0 보안 강화판)")
     print(f"📌 웹훅 엔드포인트 : http://localhost:{port}/webhook")
     print(f"📌 1초 핫스왑 관리자 페이지 : http://localhost:{port}/admin")
-    print(f"=======================================================\n")
+    print(f"=======================================================\\n")
     uvicorn.run("kakao_bot_agent_template:app", host="0.0.0.0", port=port, reload=True)

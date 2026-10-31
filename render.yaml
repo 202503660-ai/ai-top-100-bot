@@ -14,3 +14,9 @@ services:
         sync: false
       - key: KAKAO_BOT_TOKEN
         sync: false
+      - key: ACTION_API_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CONTEST_TRUST_FIRST_METADATA
+        value: "1"

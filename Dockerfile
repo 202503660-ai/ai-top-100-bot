@@ -10,4 +10,4 @@ COPY . .
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["python", "kakao_bot_agent_template.py"]
+CMD ["sh", "-c", "exec uvicorn kakao_bot_agent_template:app --host 0.0.0.0 --port ${PORT:-8000}"]
