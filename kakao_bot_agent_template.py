@@ -656,6 +656,10 @@ async def kakao_webhook(request: Request):
     if isinstance(event_type, str) and event_type in {"ENTRANCE", "CHAT_JOIN", "LEAVE", "AD_REWARD"}:
         return JSONResponse({"status": "ignored"}, status_code=200)
 
+    # 카카오 오픈빌더 관리자센터 [스킬 서버로 전송] 테스트 및 핑 지원 (userRequest가 없는 mock payload 허용)
+    if "userRequest" not in body and not body.get("d") and ("bot" in body or "action" in body):
+        return simple_text_response("AI_TOP_100 CS 봇 스킬 서버가 정상 연결되었습니다.")
+
     user_request = body.get("userRequest") if isinstance(body.get("userRequest"), dict) else {}
     user_info = user_request.get("user") or d_obj.get("author") or d_obj.get("user") or {}
     if not isinstance(user_info, dict):
@@ -667,6 +671,14 @@ async def kakao_webhook(request: Request):
 
     action = body.get("action") if isinstance(body.get("action"), dict) else {}
     params = action.get("params") if isinstance(action.get("params"), dict) else {}
+    detail_params = action.get("detailParams") if isinstance(action.get("detailParams"), dict) else {}
+    user_params = user_request.get("params") if isinstance(user_request.get("params"), dict) else {}
+    media_obj = user_params.get("media") if isinstance(user_params.get("media"), dict) else {}
+    media_url = (
+        media_obj.get("url")
+        or (detail_params.get("media", {}).get("origin") if isinstance(detail_params.get("media"), dict) else "")
+        or (params.get("media") if isinstance(params.get("media"), str) else "")
+    )
     utterance = (
         d_obj.get("content")
         or d_obj.get("message")
@@ -675,6 +687,7 @@ async def kakao_webhook(request: Request):
         or user_request.get("utterance")
         or params.get("question")
         or params.get("utterance")
+        or media_url
     )
     if not isinstance(utterance, str) or not utterance.strip():
         return JSONResponse({"error": "missing text or unsupported event"}, status_code=400)

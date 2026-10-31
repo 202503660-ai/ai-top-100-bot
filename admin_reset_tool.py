@@ -69,10 +69,11 @@ async def reset_practice_action_data(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Reset AI_TOP_100 practice action data (manual admin tool only).")
+    parser.add_argument("--token", default="", help="Action API token (or set ACTION_API_TOKEN env var).")
     parser.add_argument("--tc-id", default="L-03", help="Public TC ID for X-Aitop100-Test-Case-Id header.")
     parser.add_argument("--confirm", action="store_true", help="Confirm resetting practice action data.")
     args = parser.parse_args()
-    token = os.getenv("ACTION_API_TOKEN", "")
+    token = (args.token or os.getenv("ACTION_API_TOKEN", "")).strip()
     result = asyncio.run(reset_practice_action_data(token, tc_id=args.tc_id, confirm=args.confirm))
     print(result)
 
