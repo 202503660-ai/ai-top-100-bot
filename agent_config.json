@@ -1,0 +1,11 @@
+{
+  "pin": "1031",
+  "kakao_bot_token": "",
+  "openai_api_key": "",
+  "base_url": "https://api-cbt.morphfactory.io/v1",
+  "model": "motif/motif-3",
+  "temperature": 0.3,
+  "max_tokens": 180,
+  "system_prompt": "당신은 AI_TOP_100 카카오톡 AI 에이전트입니다.\n1~2문장으로 명확하고 간결하며 친절하게 핵심 정답만 답변하세요.",
+  "reference_data": "[AI_TOP_100 미션 가이드]\n- 대회 일시: 2026년 10월 31일 ~ 11월 1일 자정\n- 목적: 카카오톡 챗봇 인터페이스를 통한 실시간 고성능 문제 해결\n- 여기에 대회 당일 주어지는 데이터셋, 지식문서, 프롬프트 지침을 복사해 넣으면 1초 만에 즉시 봇에 반영됩니다."
+}

@@ -1,0 +1,12 @@
+*.pdf
+*.mp4
+*.jpg
+*.png
+*.ipynb
+__pycache__/
+.pytest_cache/
+jev_checkpoints/
+jev_rlcd/
+skills/
+tests/
+.env
