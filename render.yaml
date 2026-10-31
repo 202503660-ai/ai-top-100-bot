@@ -9,7 +9,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: ADMIN_PIN
-        value: "1031"
+        sync: false
       - key: OPENAI_API_KEY
         sync: false
       - key: KAKAO_BOT_TOKEN

@@ -5,7 +5,7 @@ AI_TOP_100 대비 카카오톡 AI 에이전트 서버 (v1.5.0 보안 강화판)
   - 1초 내 HTTP 200 즉각 승인 (Kakao SLA 준수)
   - X-Bot-Callback-Token + KakaoAK 비동기 메시지 콜백 API (https://kapi.kakao.com/v1/bot/callback)
 - 카카오 i 오픈빌더 스킬 동기 응답 동시 지원
-- 1초 프롬프트 & 지식 데이터 핫스왑 어드민 제어판 (강력한 PIN 1031 인증 & 비밀값 마스킹)
+- 1초 프롬프트 & 지식 데이터 핫스왑 어드민 제어판 (환경변수 PIN 인증 & 비밀값 마스킹)
 - Render 클라우드 24시간 무중단 가동 (8분 킵어웨이크 워커)
 """
 
@@ -15,6 +15,7 @@ import json
 import time
 import html
 import base64
+import hmac
 import asyncio
 from typing import Dict, Any, List, Optional
 from datetime import datetime
@@ -90,7 +91,6 @@ default_model = "motif/motif-3" if default_key.startswith("mak_") else "gpt-4o-m
 default_kakao_token = get_default_kakao_token()
 
 DEFAULT_CONFIG = {
-    "pin": os.getenv("ADMIN_PIN", "1031"),
     "kakao_bot_token": default_kakao_token,
     "openai_api_key": default_key,
     "base_url": os.getenv("OPENAI_BASE_URL", default_base_url),
@@ -241,9 +241,9 @@ def is_rate_limited(client_ip: str) -> bool:
     return len(attempts) >= 12
 
 def is_valid_pin(provided_pin: str) -> bool:
-    expected_pin = str(os.getenv("ADMIN_PIN") or current_config.get("pin") or "1031").strip()
+    expected_pin = str(os.getenv("ADMIN_PIN") or "").strip()
     provided = str(provided_pin or "").strip()
-    return bool(provided and provided == expected_pin)
+    return bool(expected_pin and provided and hmac.compare_digest(provided.encode("utf-8"), expected_pin.encode("utf-8")))
 
 def extract_pin(request: Request, body_pin: str = "", query_pin: str = "") -> str:
     auth_header = request.headers.get("authorization", "")
@@ -1328,6 +1328,6 @@ if __name__ == "__main__":
     print(f"\n=======================================================")
     print(f"🚀 AI_TOP_100 카카오봇 에이전트 서버 가동 (v1.5.0 보안 강화판)")
     print(f"📌 웹훅 엔드포인트 : http://localhost:{port}/webhook")
-    print(f"📌 1초 핫스왑 관리자 페이지 : http://localhost:{port}/admin?pin=1031")
+    print(f"📌 1초 핫스왑 관리자 페이지 : http://localhost:{port}/admin")
     print(f"=======================================================\n")
     uvicorn.run("kakao_bot_agent_template:app", host="0.0.0.0", port=port, reload=True)
