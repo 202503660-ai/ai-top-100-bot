@@ -664,7 +664,16 @@ async def kakao_webhook(request: Request):
     user_info = user_request.get("user") or d_obj.get("author") or d_obj.get("user") or {}
     if not isinstance(user_info, dict):
         return JSONResponse({"error": "invalid user"}, status_code=400)
-    user_id = user_info.get("id")
+    user_props = user_info.get("properties") if isinstance(user_info.get("properties"), dict) else {}
+    user_id = (
+        user_info.get("id")
+        or user_props.get("botUserKey")
+        or user_props.get("bot_user_key")
+        or user_props.get("plusfriendUserKey")
+        or user_props.get("appUserId")
+    )
+    if ("bot" in body or "action" in body or "intent" in body) and (not user_id or not str(user_id).strip()):
+        user_id = "kakao_test_user"
     if not isinstance(user_id, (str, int)) or isinstance(user_id, bool) or not str(user_id).strip():
         return JSONResponse({"error": "missing user identity"}, status_code=400)
     user_id = str(user_id).strip()
@@ -690,6 +699,8 @@ async def kakao_webhook(request: Request):
         or media_url
     )
     if not isinstance(utterance, str) or not utterance.strip():
+        if "bot" in body or "action" in body or "intent" in body:
+            return simple_text_response("안녕하세요! AI_TOP_100 CS 봇입니다. 무엇을 도와드릴까요?")
         return JSONResponse({"error": "missing text or unsupported event"}, status_code=400)
     utterance = utterance.strip()
 
